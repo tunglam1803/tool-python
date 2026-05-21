@@ -10,6 +10,10 @@ from PIL import Image
 from mss import mss
 from collections import deque
 import ctypes
+import colorama
+from colorama import Fore, Back, Style
+
+colorama.init(autoreset=True)
 
 CONFIG_FILE = "zippuzzle_config.json"
 MOVE_DELAY = 0.1
@@ -71,40 +75,117 @@ def get_grid_state(config):
         for i in range(rows * cols):
             r, c = i // cols, i % cols
             x1, y1, x2, y2 = int(c*cell_w), int(r*cell_h), int((c+1)*cell_w), int((r+1)*cell_h)
-            cell = img_bgr[y1:y2, x1:x2]
-            cell_up = cv2.resize(cell, (100, 100), interpolation=cv2.INTER_CUBIC)
+            
+            # Apply 20% crop inset to completely avoid grid border lines
+            w, h = x2 - x1, y2 - y1
+            inset = 0.20
+            ix1 = x1 + int(w * inset)
+            ix2 = x2 - int(w * inset)
+            iy1 = y1 + int(h * inset)
+            iy2 = y2 - int(h * inset)
+            
+            cell = img_bgr[iy1:iy2, ix1:ix2]
+            
+            # Convert color cell into high-contrast grayscale using the Min Channel operation
+            # (minimum across B, G, R channels). This yields excellent contrast for green-white
+            # and purple-black cells alike.
+            cell_gray = np.min(cell, axis=2)
+            
+            # Add border padding using BORDER_REPLICATE to naturally extend the background color
+            padded_cell = cv2.copyMakeBorder(cell_gray, 15, 15, 15, 15, cv2.BORDER_REPLICATE)
+            cell_up = cv2.resize(padded_cell, (120, 120), interpolation=cv2.INTER_CUBIC)
             cell_imgs.append(cell_up)
 
         results = get_reader().readtext_batched(cell_imgs)
         grid = [[0 for _ in range(cols)] for _ in range(rows)]
-        detected_nums = set()
         
+        # Parse all OCR results and keep candidate values + confidence scores
+        raw_detections = [] # list of (val, confidence, cell_idx)
         for i, res in enumerate(results):
-            r, c = i // cols, i % cols
-            if i == empty_idx: continue
-            
+            if i == empty_idx:
+                continue
+            val = None
+            conf = 0.0
             if res:
-                all_found = re.findall(r'\d+', " ".join([r[1] for r in res]))
-                if all_found:
-                    candidates = [int(n) for n in all_found]
-                    val = candidates[0]
-                    if val >= rows * cols:
-                        for sub in candidates:
-                            sub_str = str(sub)
-                            for l in range(len(sub_str), 0, -1):
-                                if int(sub_str[-l:]) < rows*cols: 
-                                    val = int(sub_str[-l:]); break
-                    grid[r][c] = val
-                    detected_nums.add(val)
+                candidates = []
+                for bbox, text, text_conf in res:
+                    digits = re.findall(r'\d+', text)
+                    if digits:
+                        for d in digits:
+                            d_val = int(d)
+                            # Apply suffix fix for out-of-bounds numbers
+                            if d_val >= rows * cols:
+                                d_str = str(d_val)
+                                for l in range(len(d_str), 0, -1):
+                                    cand = int(d_str[-l:])
+                                    if cand < rows * cols:
+                                        d_val = cand
+                                        break
+                            candidates.append((d_val, text_conf))
+                if candidates:
+                    candidates.sort(key=lambda x: x[1], reverse=True)
+                    val, conf = candidates[0]
+            if val is not None:
+                raw_detections.append((val, conf, i))
 
-        missing = [n for n in range(1, rows*cols) if n not in detected_nums]
+        # Resolve duplicates by confidence descending
+        raw_detections.sort(key=lambda x: x[1], reverse=True)
+        assigned_vals = {} # val -> cell_idx
+        final_cells = {} # cell_idx -> val
+        corrections = {} # cell_idx -> original_val (for terminal reporting)
+        
+        for val, conf, cell_idx in raw_detections:
+            if val not in assigned_vals:
+                assigned_vals[val] = cell_idx
+                final_cells[cell_idx] = val
+
+        # Find missing and unassigned cells
+        missing_nums = [n for n in range(1, rows*cols) if n not in assigned_vals]
+        unassigned_cells = [i for i in range(rows*cols) if i != empty_idx and i not in final_cells]
+
+        # Suffix matching heuristic to resolve duplicates
+        matched_missing = set()
+        matched_cells = set()
+        
+        cell_original_detections = {}
+        for val, conf, cell_idx in raw_detections:
+            if cell_idx in unassigned_cells:
+                if cell_idx not in cell_original_detections:
+                    cell_original_detections[cell_idx] = val
+
+        for cell_idx in unassigned_cells:
+            orig_val = cell_original_detections.get(cell_idx)
+            if orig_val is not None:
+                for m in missing_nums:
+                    if m in matched_missing:
+                        continue
+                    m_str = str(m)
+                    orig_str = str(orig_val)
+                    if m_str.endswith(orig_str) or orig_str.endswith(m_str):
+                        final_cells[cell_idx] = m
+                        matched_missing.add(m)
+                        matched_cells.add(cell_idx)
+                        corrections[cell_idx] = orig_val
+                        break
+
+        # Fill remaining cells with remaining missing numbers
+        remaining_missing = [m for m in missing_nums if m not in matched_missing]
+        remaining_cells = [c for c in unassigned_cells if c not in matched_cells]
+        for c, m in zip(remaining_cells, remaining_missing):
+            final_cells[c] = m
+            orig = cell_original_detections.get(c)
+            corrections[c] = orig if orig is not None else "None"
+
+        # Build final grid
         for r in range(rows):
             for c in range(cols):
-                if grid[r][c] == 0 and (r, c) != (er, ec):
-                    if missing:
-                        grid[r][c] = missing.pop(0)
-        
-        return grid
+                cell_idx = r * cols + c
+                if cell_idx == empty_idx:
+                    grid[r][c] = 0
+                else:
+                    grid[r][c] = final_cells.get(cell_idx, 0)
+                    
+        return grid, corrections
 
 class SlidingSolver:
     def __init__(self, grid, rows, cols):
@@ -256,38 +337,100 @@ class SlidingSolver:
             print(f"Solver Error: {e}")
             return None
 
+def is_solvable(grid, rows, cols):
+    flat = []
+    empty_row = 0
+    for r in range(rows):
+        for c in range(cols):
+            val = grid[r][c]
+            if val == 0:
+                empty_row = r
+            else:
+                flat.append(val)
+    
+    inversions = 0
+    for i in range(len(flat)):
+        for j in range(i + 1, len(flat)):
+            if flat[i] > flat[j]:
+                inversions += 1
+    
+    if cols % 2 == 1:
+        return inversions % 2 == 0
+    else:
+        row_from_bottom = rows - 1 - empty_row
+        return (inversions + row_from_bottom) % 2 == 0
+
 def main():
     config = load_config()
     if not config or 'rows' not in config: config = calibrate()
     print("\nPress Enter to OCR and Start!")
     input()
     
-    grid = get_grid_state(config)
-    print("\n--- DETECTED GRID ---")
-    for r, row in enumerate(grid):
-        print(f"Row {r}: {row}")
+    grid, corrections = get_grid_state(config)
+    
+    # Beautified console grid printing
+    print(f"\n{Fore.CYAN}╔" + "═══" * config['cols'] + "╗")
+    for r in range(config['rows']):
+        row_str = f"{Fore.CYAN}║"
+        for c in range(config['cols']):
+            val = grid[r][c]
+            cell_idx = r * config['cols'] + c
+            
+            # Formatting color
+            if val == 0:
+                cell_val = f"{Fore.MAGENTA}[ ]"
+            elif cell_idx in corrections:
+                # This cell was auto-corrected! Mark it with an asterisk
+                cell_val = f"{Fore.YELLOW}{val:<3}"
+            else:
+                cell_val = f"{Fore.GREEN}{val:<3}"
+            
+            row_str += cell_val
+        row_str += f"{Fore.CYAN}║"
+        print(row_str)
+    print(f"{Fore.CYAN}╚" + "═══" * config['cols'] + "╝")
+    
+    # Print list of corrections
+    if corrections:
+        print(f"\n{Fore.YELLOW}[OCR Auto-Corrections Applied]:")
+        for cell_idx, orig_val in corrections.items():
+            r, c = cell_idx // config['cols'], cell_idx % config['cols']
+            val = grid[r][c]
+            print(f"  • Cell ({r}, {c}) originally read as '{orig_val}' was corrected to '{val}'")
+            
+    # Check mathematical solvability
+    solvable = is_solvable(grid, config['rows'], config['cols'])
+    if solvable:
+        print(f"\n{Fore.GREEN}[✓] Mathematical Parity Check Passed: Grid is fully solvable!")
+    else:
+        print(f"\n{Fore.RED}[!] Mathematical Parity Check Failed: Grid has a parity error and is unsolvable.")
+        print(f"{Fore.YELLOW}This usually means the OCR misread a tile. Please try again or type 're' to recalibrate.")
     
     print("\nCheck the grid above. If there are errors, type 're' to recalibrate or press Enter to SOLVE.")
     choice = input().strip().lower()
     if choice == 're':
         os.remove(CONFIG_FILE); return main()
 
+    if not solvable:
+        print(f"\n{Fore.RED}[!] Aborting: Cannot solve an unsolvable grid. Please re-run or recalibrate.")
+        return
+
     solver = SlidingSolver(grid, config['rows'], config['cols'])
     moves = solver.solve()
     if moves:
         cell_w, cell_h = config['width'] / config['cols'], config['height'] / config['rows']
-        print(f"Executing {len(moves)} moves. STAY AWAY FROM MOUSE!")
+        print(f"\n{Fore.CYAN}Executing {len(moves)} moves. STAY AWAY FROM MOUSE!")
         time.sleep(2)
         for r, c in moves:
             # Emergency stop check (Esc key)
             if ctypes.windll.user32.GetAsyncKeyState(0x1B) & 0x8000:
-                print("\n[!] Emergency Stop: ESC pressed. Stopping solver.")
+                print(f"\n{Fore.RED}[!] Emergency Stop: ESC pressed. Stopping solver.")
                 break
             pyautogui.click(config['left'] + int((c+0.5)*cell_w), config['top'] + int((r+0.5)*cell_h))
             time.sleep(MOVE_DELAY)
-        print("Done!")
+        print(f"{Fore.GREEN}Done!")
     else:
-        print("\n[!] Failed to compute a stable path.")
+        print(f"\n{Fore.RED}[!] Failed to compute a stable path.")
         print("Current Grid State observed on failure:")
         for r, row in enumerate(solver.grid):
             print(f"Row {r}: {row}")
